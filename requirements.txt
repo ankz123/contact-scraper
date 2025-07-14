@@ -2,3 +2,8 @@ fastapi
 uvicorn
 httpx
 selectolax
+aiohttp
+beautifulsoup4
+pandas
+
+
