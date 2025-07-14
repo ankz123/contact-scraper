@@ -10,6 +10,8 @@ app = FastAPI()
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 PHONE_REGEX = re.compile(r"\b(?:\+91[-\s]?|0)?([6-9]\d{9})\b")
 
+JUNK_EMAIL_DOMAINS = ["sentry.wixpress.com", "sentry.io", "wixpress.com"]
+
 class BulkInput(BaseModel):
     urls: list[str]
 
@@ -60,7 +62,11 @@ async def extract_from_url(url):
             # Emails
             email_links = [a.attributes["href"].replace("mailto:", "") for a in parsed.css("a[href^='mailto:']")]
             email_texts = EMAIL_REGEX.findall(text)
-            result["emails"] = list(set(email_links + email_texts))
+            raw_emails = list(set(email_links + email_texts))
+            result["emails"] = [
+                e for e in raw_emails
+                if not any(junk in e for junk in JUNK_EMAIL_DOMAINS)
+            ]
 
             # Phones
             phone_links = [normalize_phone(a.attributes["href"].replace("tel:", "")) for a in parsed.css("a[href^='tel:']")]
@@ -77,7 +83,19 @@ async def extract(url: str = Query(...)):
 
 @app.post("/extract/bulk")
 async def extract_bulk(data: BulkInput):
-    results = await asyncio.gather(*(extract_from_url(url) for url in data.urls))
+    urls = data.urls
+    results = await asyncio.gather(*(extract_from_url(url) for url in urls))
+
+    # Retry failed
+    failed = [r["url"] for r in results if r["error"]]
+    if failed:
+        retry_results = await asyncio.gather(*(extract_from_url(url) for url in failed))
+        for retry in retry_results:
+            for i, r in enumerate(results):
+                if r["url"] == retry["url"] and r["error"]:
+                    results[i] = retry
+
+    # Write to CSV
     filename = f"results_{uuid.uuid4().hex}.csv"
     filepath = f"/tmp/{filename}"
     with open(filepath, "w", newline="") as f:
@@ -91,6 +109,7 @@ async def extract_bulk(data: BulkInput):
                 ", ".join(r["phones"]),
                 r["error"] or ""
             ])
+
     return {"results": results, "csv_url": f"/download/{filename}"}
 
 @app.get("/download/{filename}")
