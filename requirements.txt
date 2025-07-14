@@ -1,11 +1,7 @@
 fastapi
 uvicorn
-httpx
-selectolax
 aiohttp
-beautifulsoup4
 pandas
+beautifulsoup4
 python-multipart
-
-
-
+playwright
