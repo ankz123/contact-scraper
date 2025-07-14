@@ -1,7 +1,7 @@
 fastapi
-aiohttp
 uvicorn
 pandas
 beautifulsoup4
+aiohttp
+playwright
 python-multipart
-playwright==1.44.0
