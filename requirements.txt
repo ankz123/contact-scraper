@@ -5,5 +5,7 @@ selectolax
 aiohttp
 beautifulsoup4
 pandas
+python-multipart
+
 
 
