@@ -1,42 +1,51 @@
-import os
-import re
-import csv
-import asyncio
-import pandas as pd
-from urllib.parse import urljoin, urlparse
-
 from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
-
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+import pandas as pd
 import aiohttp
-from playwright.async_api import async_playwright
-
-# Auto-install Chromium in Render
-if not os.path.exists("/tmp/chromium-installed"):
-    from playwright.__main__ import main as playwright_main
-    try:
-        playwright_main(["install", "chromium"])
-        with open("/tmp/chromium-installed", "w") as f:
-            f.write("done")
-    except Exception as e:
-        print("Playwright install failed:", e)
-
-# --- CONFIG ---
-EMAIL_REGEX = re.compile(r"[\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,}")
-PHONE_REGEX = re.compile(r"(?:\+91[-\s]?|\b)([6-9]\d{9})\b")
-JUNK_EMAIL_DOMAINS = {"sentry.wixpress.com", "sentry.io", "sentry-next.wixpress.com"}
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
-}
+import asyncio
+import csv
+import os
+import re
 
 app = FastAPI()
 
+EMAIL_REGEX = re.compile(r"[\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,}")
+PHONE_REGEX = re.compile(r"(?:\+91[-\s]?|\b)([6-9]\d{9})\b")
+JUNK_EMAIL_DOMAINS = {
+    "sentry.wixpress.com", "sentry.io", "sentry-next.wixpress.com"
+}
 
-# --- HTML Scraping Helpers ---
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+}
 
-def extract_contacts_from_html(html: str):
+BATCH_SIZE = 75
+
+
+async def fetch_html(session: aiohttp.ClientSession, url: str):
+    try:
+        async with session.get(url, timeout=10) as response:
+            if response.status == 200:
+                return await response.text(), str(response.url)
+    except:
+        pass
+
+    if url.startswith("http://"):
+        https_url = url.replace("http://", "https://", 1)
+        try:
+            async with session.get(https_url, timeout=10) as response:
+                if response.status == 200:
+                    return await response.text(), str(response.url)
+        except:
+            pass
+
+    return None, url
+
+
+def extract_contacts(html: str):
     emails = set()
     phones = set()
 
@@ -51,8 +60,8 @@ def extract_contacts_from_html(html: str):
         if domain not in JUNK_EMAIL_DOMAINS:
             emails.add(match.strip())
 
-    for link in soup.find_all("a", href=True):
-        href = link["href"]
+    for match in soup.find_all("a", href=True):
+        href = match["href"]
         if href.startswith("mailto:"):
             email = href[7:].split("?")[0]
             domain = email.split("@")[-1]
@@ -69,75 +78,35 @@ def extract_contacts_from_html(html: str):
     return list(emails), list(phones)
 
 
-async def fetch_html_aiohttp(session: aiohttp.ClientSession, url: str):
-    try:
-        async with session.get(url, timeout=10) as response:
-            return await response.text(), str(response.url)
-    except:
-        return None, url
-
-
-async def fetch_html_playwright(url: str):
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.goto(url, timeout=20000)
-            content = await page.content()
-            final_url = page.url
-            await browser.close()
-            return content, final_url
-    except:
-        return None, url
-
-
-async def find_contact_page(html, base_url):
+async def find_contact_page(session, base_url, html):
     if not html:
         return base_url
 
     soup = BeautifulSoup(html, "html.parser")
-    for a in soup.find_all("a", href=True):
-        href = a["href"].lower()
-        if "contact" in href:
-            return urljoin(base_url, a["href"])
+    for link in soup.find_all("a", href=True):
+        href = link["href"].lower()
+        if any(keyword in href for keyword in ["contact", "contact-us"]):
+            return urljoin(base_url, link["href"])
 
     return base_url
 
 
-async def scrape_site(session, url: str):
-    result = {
-        "url": url,
-        "emails": [],
-        "phones": [],
-        "contact_page": None,
-        "error": None,
-    }
+async def scrape_site(session: aiohttp.ClientSession, url: str):
+    result = {"url": url, "emails": [], "phones": [], "error": None, "contact_page": None}
 
     try:
-        if not url.startswith("http"):
-            url = "http://" + url
-
-        # Try Playwright first
-        html, final_url = await fetch_html_playwright(url)
-        if not html:
-            # fallback to aiohttp
-            html, final_url = await fetch_html_aiohttp(session, url)
-
+        html, final_url = await fetch_html(session, url)
         if not html:
             result["error"] = "Site not reachable"
             return result
 
-        contact_page = await find_contact_page(html, final_url)
+        contact_page = await find_contact_page(session, url, html)
         result["contact_page"] = contact_page
 
-        emails1, phones1 = extract_contacts_from_html(html)
-
+        emails1, phones1 = extract_contacts(html)
         if contact_page != final_url:
-            contact_html, _ = await fetch_html_playwright(contact_page)
-            if not contact_html:
-                contact_html, _ = await fetch_html_aiohttp(session, contact_page)
-
-            emails2, phones2 = extract_contacts_from_html(contact_html)
+            html_contact, _ = await fetch_html(session, contact_page)
+            emails2, phones2 = extract_contacts(html_contact)
             result["emails"] = list(set(emails1 + emails2))
             result["phones"] = list(set(phones1 + phones2))
         else:
@@ -150,22 +119,23 @@ async def scrape_site(session, url: str):
     return result
 
 
-# --- Bulk Handler ---
+async def scrape_in_batches(urls):
+    all_results = []
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
+        for i in range(0, len(urls), BATCH_SIZE):
+            batch = urls[i:i + BATCH_SIZE]
+            tasks = [scrape_site(session, url.strip()) for url in batch if url.strip()]
+            results = await asyncio.gather(*tasks)
+            all_results.extend(results)
+    return all_results
+
 
 async def extract_contacts_bulk(urls):
     os.makedirs("results", exist_ok=True)
     filename = f"results_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
     filepath = os.path.join("results", filename)
 
-    async with aiohttp.ClientSession(headers=HEADERS) as session:
-        sem = asyncio.Semaphore(10)  # concurrency limit
-
-        async def safe_scrape(url):
-            async with sem:
-                return await scrape_site(session, url.strip())
-
-        tasks = [safe_scrape(url) for url in urls if url.strip()]
-        results = await asyncio.gather(*tasks)
+    results = await scrape_in_batches(urls)
 
     with open(filepath, "w", newline="") as f:
         writer = csv.writer(f)
@@ -181,8 +151,6 @@ async def extract_contacts_bulk(urls):
 
     return filename
 
-
-# --- API Routes ---
 
 @app.get("/extract")
 async def extract_single(url: str = Query(...)):
