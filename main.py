@@ -4,154 +4,151 @@ import csv
 import aiohttp
 import asyncio
 import pandas as pd
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
 from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
-from datetime import datetime
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
 
 app = FastAPI()
 
-# ------------------ UTILS ------------------ #
+EMAIL_REGEX = re.compile(r"[\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,}")
+PHONE_REGEX = re.compile(r"(?:\+91[-\s]?|\b)([6-9]\d{9})\b")
+JUNK_EMAIL_DOMAINS = {"sentry.wixpress.com", "sentry.io", "sentry-next.wixpress.com"}
 
-EMAIL_REGEX = r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"
-PHONE_REGEX = r"(?:(?:\+91[\-\s]?)|(?:0))?[6-9]\d{9}"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+}
 
-JUNK_EMAIL_SUBSTRINGS = [
-    "sentry.io", "sentry.wixpress.com", "wixpress.com",
-    "polyfill", "core-js", "react", "lodash", "focus"
-]
 
-def is_valid_email(email):
-    if re.search(r"@\d", email):
-        return False
-    return not any(bad in email for bad in JUNK_EMAIL_SUBSTRINGS)
-
-def normalize_phone(number):
-    digits = re.sub(r"\D", "", number)
-    if len(digits) == 10:
-        return f"+91{digits}"
-    if len(digits) == 12 and digits.startswith("91"):
-        return f"+{digits}"
-    return None
-
-async def fetch(session, url):
+async def fetch_html(session: aiohttp.ClientSession, url: str):
     try:
-        async with session.get(url, timeout=20) as resp:
-            if resp.status == 200:
-                return await resp.text()
-    except Exception:
-        return None
+        async with session.get(url, timeout=10) as response:
+            return await response.text(), str(response.url)
+    except:
+        return None, url
 
-async def find_contact_page(session, base_url):
-    try:
-        html = await fetch(session, base_url)
-        if not html:
-            return None
-        soup = BeautifulSoup(html, "html.parser")
-        for link in soup.find_all("a", href=True):
-            href = link["href"].lower()
-            if any(k in href for k in ["contact", "get-in-touch", "reach-us"]):
-                full_url = urljoin(base_url, href)
-                return full_url
-    except Exception:
-        return None
-    return None
 
-def extract_visible_phones(soup):
-    visible_phones = set()
-    tags_to_check = ["a", "p", "div", "span", "li", "td"]
-    for tag in soup.find_all(tags_to_check):
-        text = tag.get_text(separator=" ", strip=True)
-        found = re.findall(PHONE_REGEX, text)
-        visible_phones.update(found)
-    return visible_phones
-
-async def scrape_site(session, url):
+def extract_contacts(html: str):
     emails = set()
     phones = set()
-    error = None
+
+    if not html:
+        return [], []
+
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text()
+
+    for match in EMAIL_REGEX.findall(text):
+        domain = match.split("@")[-1]
+        if domain not in JUNK_EMAIL_DOMAINS:
+            emails.add(match.strip())
+
+    for match in soup.find_all("a", href=True):
+        href = match["href"]
+        if href.startswith("mailto:"):
+            email = href[7:].split("?")[0]
+            domain = email.split("@")[-1]
+            if domain not in JUNK_EMAIL_DOMAINS:
+                emails.add(email.strip())
+        elif href.startswith("tel:"):
+            phone = href[4:].strip()
+            if phone.isdigit() and len(phone) == 10:
+                phones.add("+91" + phone)
+
+    for phone in PHONE_REGEX.findall(text):
+        phones.add("+91" + phone.strip())
+
+    return list(emails), list(phones)
+
+
+async def find_contact_page(session, base_url, html):
+    if not html:
+        return base_url
+
+    soup = BeautifulSoup(html, "html.parser")
+    for link in soup.find_all("a", href=True):
+        href = link["href"].lower()
+        if any(keyword in href for keyword in ["contact", "contact-us"]):
+            return urljoin(base_url, link["href"])
+
+    return base_url
+
+
+async def scrape_site(session: aiohttp.ClientSession, url: str):
+    result = {"url": url, "emails": [], "phones": [], "error": None, "contact_page": None}
 
     try:
-        contact_url = await find_contact_page(session, url) or url
-        html = await fetch(session, contact_url)
-
+        html, final_url = await fetch_html(session, url)
         if not html:
-            return {
-                "url": url,
-                "emails": [],
-                "phones": [],
-                "error": "Site not reachable",
-                "contact_page": contact_url
-            }
+            result["error"] = "Site not reachable"
+            return result
 
-        soup = BeautifulSoup(html, "html.parser")
-        emails.update(re.findall(EMAIL_REGEX, html))
-        visible_phones = extract_visible_phones(soup)
-        phones.update(visible_phones)
+        contact_page = await find_contact_page(session, url, html)
+        result["contact_page"] = contact_page
 
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            emails.update(re.findall(EMAIL_REGEX, href))
-            phones.update(re.findall(PHONE_REGEX, href))
-
-        emails = {e.strip() for e in emails if is_valid_email(e)}
-        phones = {normalize_phone(p) for p in phones if normalize_phone(p)}
+        # If contact page is different from homepage, scrape both
+        emails1, phones1 = extract_contacts(html)
+        if contact_page != final_url:
+            html_contact, _ = await fetch_html(session, contact_page)
+            emails2, phones2 = extract_contacts(html_contact)
+            result["emails"] = list(set(emails1 + emails2))
+            result["phones"] = list(set(phones1 + phones2))
+        else:
+            result["emails"] = emails1
+            result["phones"] = phones1
 
     except Exception as e:
-        error = str(e)
+        result["error"] = str(e)
 
-    return {
-        "url": url,
-        "contact_page": contact_url,
-        "emails": list(emails),
-        "phones": list(phones),
-        "error": error
-    }
+    return result
 
-# ------------------ BULK ------------------ #
 
-async def extract_contacts_bulk(urls: list[str]):
-    filename = f"results/results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+async def extract_contacts_bulk(urls):
     os.makedirs("results", exist_ok=True)
+    filename = f"results_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    filepath = os.path.join("results", filename)
 
-    async with aiohttp.ClientSession() as session:
-        results = await asyncio.gather(*[scrape_site(session, url) for url in urls])
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
+        tasks = [scrape_site(session, url.strip()) for url in urls if url.strip()]
+        results = await asyncio.gather(*tasks)
 
-    with open(filename, "w", newline="") as f:
+    with open(filepath, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["URL", "Contact Page", "Emails", "Phones", "Error"])
         for r in results:
             writer.writerow([
                 r["url"],
                 r.get("contact_page", ""),
-                ", ".join(r["emails"]),
-                ", ".join(r["phones"]),
-                r["error"] or ""
+                ", ".join(r.get("emails", [])),
+                ", ".join(r.get("phones", [])),
+                r.get("error", "")
             ])
 
-    return os.path.basename(filename)
+    return filename
 
-# ------------------ ROUTES ------------------ #
 
 @app.get("/extract")
 async def extract_single(url: str = Query(...)):
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
         return await scrape_site(session, url)
+
 
 class BulkInput(BaseModel):
     urls: list[str]
+
 
 @app.post("/extract/bulk")
 async def extract_bulk(data: BulkInput):
     filename = await extract_contacts_bulk(data.urls)
     return {"csv_url": f"/download/{filename}"}
 
+
 @app.post("/extract/upload")
 async def extract_from_file(file: UploadFile = File(...)):
     if not file.filename.endswith(".csv"):
         return {"error": "Only CSV files supported."}
+
     try:
         df = pd.read_csv(file.file, header=None)
         urls = df[0].dropna().tolist()
@@ -159,6 +156,7 @@ async def extract_from_file(file: UploadFile = File(...)):
         return {"csv_url": f"/download/{filename}"}
     except Exception as e:
         return {"error": str(e)}
+
 
 @app.get("/download/{filename}")
 async def download_file(filename: str):
