@@ -1,9 +1,10 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, UploadFile, File
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from urllib.parse import urljoin
 import httpx, re, csv, uuid, os, asyncio
 from selectolax.parser import HTMLParser
+import io
 
 app = FastAPI()
 
@@ -11,6 +12,7 @@ EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 PHONE_REGEX = re.compile(r"\b(?:\+91[-\s]?|0)?([6-9]\d{9})\b")
 
 JUNK_EMAIL_DOMAINS = ["sentry.wixpress.com", "sentry.io", "wixpress.com"]
+CONCURRENCY_LIMIT = 10  # Limit how many URLs are scraped in parallel
 
 class BulkInput(BaseModel):
     urls: list[str]
@@ -26,7 +28,13 @@ async def fetch_html(url, session):
     except:
         return None
 
-async def extract_from_url(url):
+async def extract_from_url(url, semaphore=None):
+    if semaphore:
+        async with semaphore:
+            return await _extract(url)
+    return await _extract(url)
+
+async def _extract(url):
     result = {
         "url": url,
         "contact_page": None,
@@ -34,7 +42,6 @@ async def extract_from_url(url):
         "phones": [],
         "error": None
     }
-
     try:
         async with httpx.AsyncClient(follow_redirects=True) as session:
             home_html = await fetch_html(url, session)
@@ -59,7 +66,6 @@ async def extract_from_url(url):
             parsed = HTMLParser(contact_html)
             text = parsed.body.text()
 
-            # Emails
             email_links = [a.attributes["href"].replace("mailto:", "") for a in parsed.css("a[href^='mailto:']")]
             email_texts = EMAIL_REGEX.findall(text)
             raw_emails = list(set(email_links + email_texts))
@@ -68,7 +74,6 @@ async def extract_from_url(url):
                 if not any(junk in e for junk in JUNK_EMAIL_DOMAINS)
             ]
 
-            # Phones
             phone_links = [normalize_phone(a.attributes["href"].replace("tel:", "")) for a in parsed.css("a[href^='tel:']")]
             phone_texts = [normalize_phone(p) for p in PHONE_REGEX.findall(text)]
             result["phones"] = list(set(phone_links + phone_texts))
@@ -83,19 +88,17 @@ async def extract(url: str = Query(...)):
 
 @app.post("/extract/bulk")
 async def extract_bulk(data: BulkInput):
-    urls = data.urls
-    results = await asyncio.gather(*(extract_from_url(url) for url in urls))
+    semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
+    results = await asyncio.gather(*(extract_from_url(url, semaphore) for url in data.urls))
 
-    # Retry failed
     failed = [r["url"] for r in results if r["error"]]
     if failed:
-        retry_results = await asyncio.gather(*(extract_from_url(url) for url in failed))
-        for retry in retry_results:
-            for i, r in enumerate(results):
-                if r["url"] == retry["url"] and r["error"]:
-                    results[i] = retry
+        retry = await asyncio.gather(*(extract_from_url(url, semaphore) for url in failed))
+        for r in retry:
+            for i, res in enumerate(results):
+                if res["url"] == r["url"] and res["error"]:
+                    results[i] = r
 
-    # Write to CSV
     filename = f"results_{uuid.uuid4().hex}.csv"
     filepath = f"/tmp/{filename}"
     with open(filepath, "w", newline="") as f:
@@ -109,8 +112,15 @@ async def extract_bulk(data: BulkInput):
                 ", ".join(r["phones"]),
                 r["error"] or ""
             ])
-
     return {"results": results, "csv_url": f"/download/{filename}"}
+
+@app.post("/extract/upload")
+async def extract_upload(file: UploadFile = File(...)):
+    contents = await file.read()
+    f = io.StringIO(contents.decode("utf-8"))
+    reader = csv.reader(f)
+    urls = [row[0] for row in reader if row]
+    return await extract_bulk(BulkInput(urls=urls))
 
 @app.get("/download/{filename}")
 async def download(filename: str):
