@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 aiohttp
+bs4
 pandas
-beautifulsoup4
 python-multipart
 playwright
