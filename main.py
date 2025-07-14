@@ -1,48 +1,57 @@
+import os
+import re
+import csv
+import aiohttp
+import asyncio
+import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
-import pandas as pd
-import aiohttp
-import asyncio
-import csv
-import os
-import re
 
 app = FastAPI()
 
 EMAIL_REGEX = re.compile(r"[\w\.-]+@[\w\.-]+\.[a-zA-Z]{2,}")
-PHONE_REGEX = re.compile(r"(?:\+91[-\s]?|\b)([6-9]\d{9})\b")
-JUNK_EMAIL_DOMAINS = {
-    "sentry.wixpress.com", "sentry.io", "sentry-next.wixpress.com"
-}
+JUNK_EMAIL_DOMAINS = {"sentry.wixpress.com", "sentry.io", "sentry-next.wixpress.com"}
+
+# Universal phone number pattern
+PHONE_REGEX = re.compile(
+    r"""
+    (?:
+        (?:\+|00)?             # + or 00 prefix (optional)
+        \d{1,3}                # Country code
+        [\s\-\.]*
+    )?
+    (?:
+        \(?\d{2,4}\)?          # Area code (optional parentheses)
+        [\s\-\.]*
+    )?
+    \d{3,4}                   # First part
+    [\s\-\.]*
+    \d{3,4}                   # Second part
+    """,
+    re.VERBOSE
+)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
 }
 
-BATCH_SIZE = 75
-
 
 async def fetch_html(session: aiohttp.ClientSession, url: str):
     try:
         async with session.get(url, timeout=10) as response:
-            if response.status == 200:
-                return await response.text(), str(response.url)
+            return await response.text(), str(response.url)
     except:
-        pass
+        return None, url
 
-    if url.startswith("http://"):
-        https_url = url.replace("http://", "https://", 1)
-        try:
-            async with session.get(https_url, timeout=10) as response:
-                if response.status == 200:
-                    return await response.text(), str(response.url)
-        except:
-            pass
 
-    return None, url
+def clean_phone(phone: str) -> str:
+    digits = re.sub(r"[^\d]", "", phone)
+    if len(digits) >= 10:
+        return "+" + digits if not digits.startswith("+") else digits
+    return None
 
 
 def extract_contacts(html: str):
@@ -55,6 +64,7 @@ def extract_contacts(html: str):
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text()
 
+    # Find emails
     for match in EMAIL_REGEX.findall(text):
         domain = match.split("@")[-1]
         if domain not in JUNK_EMAIL_DOMAINS:
@@ -68,12 +78,15 @@ def extract_contacts(html: str):
             if domain not in JUNK_EMAIL_DOMAINS:
                 emails.add(email.strip())
         elif href.startswith("tel:"):
-            phone = href[4:].strip()
-            if phone.isdigit() and len(phone) == 10:
-                phones.add("+91" + phone)
+            cleaned = clean_phone(href[4:])
+            if cleaned:
+                phones.add(cleaned)
 
-    for phone in PHONE_REGEX.findall(text):
-        phones.add("+91" + phone.strip())
+    # Find phone numbers in visible text
+    for match in PHONE_REGEX.findall(text):
+        cleaned = clean_phone(match)
+        if cleaned:
+            phones.add(cleaned)
 
     return list(emails), list(phones)
 
@@ -103,6 +116,7 @@ async def scrape_site(session: aiohttp.ClientSession, url: str):
         contact_page = await find_contact_page(session, url, html)
         result["contact_page"] = contact_page
 
+        # Scrape main page and contact page if different
         emails1, phones1 = extract_contacts(html)
         if contact_page != final_url:
             html_contact, _ = await fetch_html(session, contact_page)
@@ -119,23 +133,20 @@ async def scrape_site(session: aiohttp.ClientSession, url: str):
     return result
 
 
-async def scrape_in_batches(urls):
-    all_results = []
-    async with aiohttp.ClientSession(headers=HEADERS) as session:
-        for i in range(0, len(urls), BATCH_SIZE):
-            batch = urls[i:i + BATCH_SIZE]
-            tasks = [scrape_site(session, url.strip()) for url in batch if url.strip()]
-            results = await asyncio.gather(*tasks)
-            all_results.extend(results)
-    return all_results
-
-
 async def extract_contacts_bulk(urls):
     os.makedirs("results", exist_ok=True)
     filename = f"results_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
     filepath = os.path.join("results", filename)
 
-    results = await scrape_in_batches(urls)
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
+        tasks = []
+        batch_size = 75
+        for i in range(0, len(urls), batch_size):
+            batch = urls[i:i+batch_size]
+            tasks += [scrape_site(session, url.strip()) for url in batch]
+            await asyncio.sleep(0.5)
+
+        results = await asyncio.gather(*tasks)
 
     with open(filepath, "w", newline="") as f:
         writer = csv.writer(f)
