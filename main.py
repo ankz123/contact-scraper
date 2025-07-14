@@ -139,7 +139,7 @@ async def extract_from_file(file: UploadFile = File(...)):
     try:
         df = pd.read_csv(file.file, header=None)
         urls = df[0].dropna().tolist()
-        filename = await asyncio.to_thread(extract_contacts_bulk, urls)
+        filename = await extract_contacts_bulk(urls)  # ✅ FIXED
         return {"csv_url": f"/download/{filename}"}
     except Exception as e:
         return {"error": str(e)}
